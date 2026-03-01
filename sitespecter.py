@@ -13,11 +13,12 @@ A d3vn0mi open-source tool.
 https://github.com/d3vn0mi
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "d3vn0mi"
 __license__ = "MIT"
 
 import argparse
+import hashlib
 import os
 import re
 import sys
@@ -30,6 +31,11 @@ from urllib.parse import urljoin, urlparse, urldefrag, parse_qsl, urlencode
 
 import requests
 from bs4 import BeautifulSoup
+
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp",
+    ".ico", ".tiff", ".tif", ".avif", ".jfif",
+}
 
 BANNER = r"""
  ____  _ _       ____                  _
@@ -117,6 +123,114 @@ def extract_links(base_url: str, html: str) -> Set[str]:
     return links
 
 
+def extract_image_urls(base_url: str, html: str) -> Set[str]:
+    """Extract all image URLs from HTML: <img src>, <img srcset>, <source srcset>,
+    and inline style background-image urls."""
+    soup = BeautifulSoup(html, "html.parser")
+    urls: Set[str] = set()
+
+    # <img src="...">
+    for img in soup.find_all("img", src=True):
+        src = img.get("src", "").strip()
+        if src and not src.startswith("data:"):
+            urls.add(urljoin(base_url, src))
+
+    # <img srcset="..."> and <source srcset="...">
+    for tag in soup.find_all(["img", "source"], srcset=True):
+        srcset = tag.get("srcset", "")
+        for entry in srcset.split(","):
+            parts = entry.strip().split()
+            if parts and not parts[0].startswith("data:"):
+                urls.add(urljoin(base_url, parts[0]))
+
+    # <picture> <source> tags
+    for source in soup.find_all("source", src=True):
+        src = source.get("src", "").strip()
+        if src and not src.startswith("data:"):
+            urls.add(urljoin(base_url, src))
+
+    # inline style background-image: url(...)
+    for tag in soup.find_all(style=True):
+        style = tag.get("style", "")
+        for match in re.finditer(r'url\(["\']?([^"\')\s]+)["\']?\)', style):
+            img_url = match.group(1).strip()
+            if not img_url.startswith("data:"):
+                urls.add(urljoin(base_url, img_url))
+
+    return urls
+
+
+def safe_image_filename(url: str) -> str:
+    """Derive a safe local filename for an image URL, preserving the original
+    name when possible and appending a short hash to avoid collisions."""
+    parsed = urlparse(url)
+    path = parsed.path or ""
+    basename = Path(path).name if path else ""
+
+    # If no usable basename, generate one from the full URL
+    if not basename or basename == "/":
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+        basename = f"image_{url_hash}"
+
+    # Sanitize
+    basename = re.sub(r"[^a-zA-Z0-9._-]", "_", basename)[:200]
+
+    # Add a short hash suffix to avoid collisions from different paths
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+    stem = Path(basename).stem
+    suffix = Path(basename).suffix or ".jpg"
+    return f"{stem}_{url_hash}{suffix}"
+
+
+def download_images(
+    image_urls: Set[str],
+    pictures_dir: Path,
+    session: requests.Session,
+    timeout: float,
+    delay: float,
+    quiet: bool = False,
+) -> int:
+    """Download a set of image URLs into the pictures directory. Returns count saved."""
+    pictures_dir.mkdir(parents=True, exist_ok=True)
+    downloaded = 0
+    seen_files: Set[str] = set()
+
+    for img_url in image_urls:
+        filename = safe_image_filename(img_url)
+        if filename in seen_files:
+            continue
+        seen_files.add(filename)
+
+        dest = pictures_dir / filename
+        if dest.exists():
+            continue
+
+        try:
+            resp = session.get(img_url, timeout=timeout, stream=True)
+            if resp.status_code >= 400:
+                continue
+
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if not (ctype.startswith("image/") or Path(urlparse(img_url).path).suffix.lower() in IMAGE_EXTENSIONS):
+                continue
+
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            downloaded += 1
+            if not quiet:
+                print(f"  [img] {img_url} -> pictures/{filename}")
+
+            if delay > 0:
+                time.sleep(delay)
+
+        except requests.RequestException:
+            continue
+
+    return downloaded
+
+
 @dataclass
 class CrawlItem:
     url: str
@@ -140,7 +254,8 @@ def crawl_and_save(
     user_agent: str,
     timeout: float,
     quiet: bool = False,
-) -> Tuple[int, int]:
+    download_pics: bool = True,
+) -> Tuple[int, int, int]:
     out_dir.mkdir(parents=True, exist_ok=True)
     start_url = normalize_url(start_url)
     start_host = urlparse(start_url).netloc
@@ -148,6 +263,7 @@ def crawl_and_save(
     visited: Set[str] = set()
     queued: Set[str] = set([start_url])
     q: deque[CrawlItem] = deque([CrawlItem(start_url, 0)])
+    all_image_urls: Set[str] = set()
     saved = 0
     fetched = 0
 
@@ -195,6 +311,10 @@ def crawl_and_save(
             if not quiet:
                 print(f"  [depth={depth}] {final_url} -> {rel_path}")
 
+            # Collect image URLs from this page
+            if download_pics:
+                all_image_urls.update(extract_image_urls(final_url, html))
+
             # Enqueue new links if depth allows
             if depth < max_depth:
                 for link in extract_links(final_url, html):
@@ -214,7 +334,22 @@ def crawl_and_save(
                 print(f"  [ERR] {url}: {exc}")
             continue
 
-    return fetched, saved
+    # Download all collected images
+    images_saved = 0
+    if download_pics and all_image_urls:
+        if not quiet:
+            print(f"\n  Found {len(all_image_urls)} images. Downloading...")
+        pictures_dir = out_dir / "pictures"
+        images_saved = download_images(
+            image_urls=all_image_urls,
+            pictures_dir=pictures_dir,
+            session=session,
+            timeout=timeout,
+            delay=delay,
+            quiet=quiet,
+        )
+
+    return fetched, saved, images_saved
 
 
 def main() -> int:
@@ -235,6 +370,7 @@ def main() -> int:
     )
     p.add_argument("--ua", default=f"SiteSpecter/{__version__} (d3vn0mi)", help="User-Agent string")
     p.add_argument("--timeout", type=float, default=15.0, help="HTTP timeout seconds (default: 15)")
+    p.add_argument("--no-pictures", action="store_true", help="Skip downloading images (default: download all images)")
     p.add_argument("-q", "--quiet", action="store_true", help="Suppress per-page output")
     p.add_argument("-v", "--version", action="version", version=f"SiteSpecter {__version__} by d3vn0mi")
 
@@ -247,10 +383,12 @@ def main() -> int:
     print(f"  Output : {out_dir.resolve()}")
     print(f"  Depth  : {args.max_depth}  |  Max pages: {args.max_pages}")
     print(f"  Delay  : {args.delay}s  |  Timeout: {args.timeout}s")
+    download_pics = not args.no_pictures
     print(f"  Domain : {'same-domain only' if same_domain_only else 'cross-domain allowed'}")
+    print(f"  Images : {'enabled' if download_pics else 'disabled'}")
     print()
 
-    fetched, saved = crawl_and_save(
+    fetched, saved, images_saved = crawl_and_save(
         start_url=args.url,
         out_dir=out_dir,
         max_depth=max(0, args.max_depth),
@@ -260,11 +398,14 @@ def main() -> int:
         user_agent=args.ua,
         timeout=max(1.0, args.timeout),
         quiet=args.quiet,
+        download_pics=download_pics,
     )
 
     print()
     print(f"  Fetched : {fetched} pages")
     print(f"  Saved   : {saved} HTML files -> {out_dir.resolve()}")
+    if download_pics:
+        print(f"  Images  : {images_saved} pictures -> {(out_dir / 'pictures').resolve()}")
     print()
     print("  Done. // d3vn0mi")
 
